@@ -38,17 +38,12 @@ from PyPDF2 import PdfReader
 from PIL import Image, ImageDraw
 import io
 
-# Import additional libraries with error handling
-try:
-    import camelot
-    import cv2
-    import numpy as np
-    import pandas as pd
-    HAS_ADVANCED_LIBRARIES = True
-except ImportError:
-    HAS_ADVANCED_LIBRARIES = False
-    logging.warning("Advanced libraries (camelot, cv2, pandas) not found. Some features will be disabled.")
-    logging.warning("To enable all features, install: pip install camelot-py opencv-python-headless pandas ghostscript")
+# Import additional libraries
+import camelot
+import cv2
+import numpy as np
+import pandas as pd
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -128,11 +123,10 @@ def save_page_as_image(pdf_path: str, page_num: int, output_dir: str = "./images
             img = page.to_image(resolution=300)
             img.save(output_path, format="PNG")
             
-        logger.info(f"Saved page {page_num+1} as image: {output_path}")
         return output_path
     
     except Exception as e:
-        logger.error(f"Error saving page as image: {str(e)}")
+        pass
         return ""
 
 
@@ -325,7 +319,7 @@ def extract_tables(page) -> List[Dict[str, Any]]:
                             'y1': found_tables[i].bbox[3]
                         }
             except Exception as e:
-                logger.warning(f"Error getting table boundaries: {str(e)}")
+                pass
             
             # Create the table entry
             table_entry = {
@@ -432,7 +426,7 @@ def extract_tables_with_camelot(pdf_path: str, page_num: int) -> List[Dict[str, 
             tables.append(table_entry)
             
     except Exception as e:
-        logger.warning(f"Error extracting tables with camelot: {str(e)}")
+        pass
     
     return tables
 
@@ -504,7 +498,7 @@ def extract_spatial_elements(page) -> List[Dict[str, Any]]:
             elements.append(element)
             
     except Exception as e:
-        logger.warning(f"Error extracting spatial elements: {str(e)}")
+        pass
     
     return elements
 
@@ -577,7 +571,7 @@ def process_page(page, page_num: int, pdf_path: str, output_dir: str) -> Dict[st
                         table['table_number'] = existing_table_count + i + 1
                         page_info['tables'].append(table)
             except Exception as e:
-                logger.warning(f"Error in advanced table extraction for page {page_num+1}: {str(e)}")
+                pass
     
     # Add page dimensions
     page_info['width'] = page.width
@@ -810,7 +804,7 @@ def save_json_output(document_info: Dict[str, Any], output_path: Optional[str] =
         # Generate output filename based on input filename
         if 'filename' in document_info:
             base_name = os.path.splitext(document_info['filename'])[0]
-            output_path = f"{base_name}_output.json"
+            output_path = f"{base_name}.json"
         else:
             output_path = "pdf_output.json"
     
