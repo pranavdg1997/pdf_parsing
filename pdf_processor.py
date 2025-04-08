@@ -1,381 +1,559 @@
+#!/usr/bin/env python3
+"""
+PDF Processing Pipeline
 
+This script processes PDF documents to extract structured information and generates 
+JSON output containing document metadata, text content, and structure information.
 
-from __future__ import annotations
+Features:
+- Extracts text from digital PDFs
+- Converts scanned/image-based PDF pages to PNG images
+- Identifies headings, sections, and their boundaries
+- Generates structured JSON output with document metadata
+- Advanced table extraction using Camelot
+- Spatial analysis of PDF elements
+- Enhanced metadata extraction
+- Document type detection
 
-import argparse
-import json
-import logging
+Dependencies:
+- pdfplumber: For text extraction and layout analysis
+- PyPDF2: For PDF document analysis
+- Camelot: For advanced table extraction (optional)
+- OpenCV: For image processing (optional)
+- Pillow: For image handling and manipulation
+- pandas: For data manipulation with Camelot tables (optional)
+- re: For pattern matching
+
+Changes:
+1) Parallel processing added where possible.
+2) Storing word coordinates in a CSV instead of the JSON.
+3) Extracted tables in CSV, storing the CSV file names in JSON.
+"""
+
 import os
+import json
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
-
+import logging
+import tempfile
+import subprocess
+from typing import Dict, List, Tuple, Any, Optional, Union
+import argparse
 import pdfplumber
 from PyPDF2 import PdfReader
+from PIL import Image
+import io
+import camelot
+import cv2
+import numpy as np
+import pandas as pd
 
-# Third‑party (optional) -------------------------------------------------------
-try:
-    import camelot  # type: ignore
-    HAS_CAMELOT = True
-except Exception:
-    HAS_CAMELOT = False
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import pandas as pd  # always required (used for CSV writing)
-from PIL import Image  # noqa: F401  (used indirectly by pdfplumber)
-
-# ----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s – %(levelname)s – %(message)s")
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-###############################################################################
-# Helper functions                                                             #
-###############################################################################
 
-def is_page_scanned(page: pdfplumber.page.Page) -> bool:
-    """Heuristic to decide whether *page* is image‑based (scanned) or text‑based."""
-    text = page.extract_text() or ""
+def is_page_scanned(page) -> bool:
+    """
+    Determine if a PDF page is scanned (image-based) or contains digital text.
+    """
+    text = page.extract_text()
 
-    if not text.strip():
-        return True  # no digital text at all
+    # 1. If there's no text at all, it's definitely a scanned page
+    if not text:
+        return True
 
-    if len(text) < 100 and page.images:
-        return True  # very little text but images exist
+    # 2. If there's very little text but many images, it's likely a scanned page
+    if len(text.strip()) < 100 and len(page.images) > 0:
+        return True
 
-    if page.images:
-        text_chars_per_image = len(text) / len(page.images)
-        if text_chars_per_image < 200:
+    # 3. Check for OCR artifacts
+    if text and len(page.images) > 0:
+        ocr_artifacts = re.findall(r'[^\\w\\s,.;:!?()\\[\\]{}"\'-]{3,}', text)
+        if len(ocr_artifacts) > 3:
             return True
 
-    # crude OCR artifact check
-    artefacts = re.findall(r"[^\w\s,.;:!?()\[\]{}\-]{3,}", text)
-    if len(artefacts) > 3:
-        return True
+    # 4. Check text to image ratio
+    if len(page.images) > 0:
+        text_chars = len(text.strip())
+        if text_chars / len(page.images) < 200:
+            return True
 
     return False
 
 
-def save_page_as_image(pdf_path: str, page_num: int, out_dir: str = "./images") -> str:
-    """Rasterise *page_num* (0‑indexed) of *pdf_path* to PNG, return filepath."""
-    os.makedirs(out_dir, exist_ok=True)
-    stem = os.path.splitext(os.path.basename(pdf_path))[0]
-    out_path = os.path.join(out_dir, f"{stem}_page_{page_num + 1}.png")
+def save_page_as_image(pdf_path: str, page_num: int, output_dir: str = "./images") -> str:
+    """
+    Convert a PDF page to an image and save it to disk.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    output_path = os.path.join(output_dir, f"{base_name}_page_{page_num+1}.png")
+
     try:
-        with pdfplumber.open(pdf_path) as pl:
-            pl.pages[page_num].to_image(resolution=300).save(out_path, format="PNG")
-        return out_path
-    except Exception as exc:
-        logger.error("Failed to rasterise page %s: %s", page_num + 1, exc)
+        pdf = PdfReader(pdf_path)
+        if page_num >= len(pdf.pages):
+            logger.error(f"Page {page_num+1} does not exist in the PDF")
+            return ""
+        with pdfplumber.open(pdf_path) as plumb_pdf:
+            page = plumb_pdf.pages[page_num]
+            img = page.to_image(resolution=300)
+            img.save(output_path, format="PNG")
+        return output_path
+    except Exception as e:
+        logger.error(f"Error converting page to image: {e}")
         return ""
 
-###############################################################################
-# Heading / section utilities                                                 #
-###############################################################################
 
 def extract_headings(text: str) -> List[Dict[str, Any]]:
-    """Return a list of detected headings with hierarchy level."""
-    patterns = [
-        (r"^[\s]*([A-Z][A-Z\s]+)[\s]*$", 1),  # ALL‑CAPS
-        (r"^[\s]*(\d+\.\s+.+)[\s]*$", 2),     # 1. Intro
-        (r"^[\s]*([A-Z][A-Za-z\s]+):[\s]*$", 2),  # Background:
-        (r"^[\s]*([A-Z][a-z\s]{2,})[\s]*$", 3),   # Sentence case
-        (r"^[\s]*[•\-*]\s+([A-Z].+?)[\s]*$", 3),  # bullet
+    """
+    Extract heading information from text with improved hierarchy detection.
+    """
+    headings = []
+    heading_patterns = [
+        {'pattern': r'^[\s]*([A-Z][A-Z\s]+)[\s]*$', 'level': 1},
+        {'pattern': r'^[\s]*(\d+\.\s+.+)[\s]*$', 'level': 2},
+        {'pattern': r'^[\s]*([A-Z][A-Za-z\s]+):[\s]*$', 'level': 2},
+        {'pattern': r'^[\s]*([A-Z][a-z\s]{2,})[\s]*$', 'level': 3},
+        {'pattern': r'^[\s]*[•\-\*]\s+([A-Z].+?)[\s]*$', 'level': 3}
     ]
 
-    headings: List[Dict[str, Any]] = []
-    ctx: dict[int, List[str]] = {}
-    prev_lvl = 0
-    prev_text: Optional[str] = None
+    lines = text.split('\n')
+    line_num = 0
+    prev_heading_level = 0
+    prev_heading = None
+    heading_contexts = {}
 
-    for ln, line in enumerate(text.split("\n"), start=1):
-        stripped = line.strip()
-        if not stripped:
+    for line in lines:
+        line_num += 1
+        line = line.strip()
+        if not line:
             continue
-        for pat, base_lvl in patterns:
-            m = re.match(pat, stripped)
-            if not m:
-                continue
-            htext = m.group(1).strip()
-            if len(htext) < 3:
+
+        for pattern_info in heading_patterns:
+            pattern = pattern_info['pattern']
+            base_level = pattern_info['level']
+            matches = re.match(pattern, line)
+            if matches:
+                heading_text = matches.group(1).strip()
+                if len(heading_text) < 3:
+                    continue
+                level = base_level
+
+                # Adjust based on uppercase
+                if heading_text.isupper() and len(heading_text) > 5:
+                    level = min(level, 1)
+                elif heading_text.isupper():
+                    level = min(level, 2)
+
+                # Indentation-based adjustment
+                leading_spaces = len(line) - len(line.lstrip())
+                if leading_spaces > 4:
+                    level += 1
+
+                # Handle nested headings
+                if prev_heading is not None and prev_heading_level > 0 and level > prev_heading_level:
+                    heading_contexts[level] = heading_contexts.get(prev_heading_level, []) + [prev_heading]
+
+                parent = None
+                if level > 1 and level-1 in heading_contexts and heading_contexts[level-1]:
+                    parent = heading_contexts.get(level-1, [])[-1]
+
+                heading_entry = {
+                    'text': heading_text,
+                    'line_number': line_num,
+                    'level': level,
+                    'parent': parent
+                }
+
+                headings.append(heading_entry)
+                prev_heading = heading_text
+                prev_heading_level = level
                 break
-            lvl = base_lvl
-            if htext.isupper() and len(htext) > 5:
-                lvl = 1
-            elif htext.isupper():
-                lvl = min(lvl, 2)
-            indent = len(line) - len(line.lstrip())
-            if indent > 4:
-                lvl += 1
-            if prev_text and lvl > prev_lvl:
-                ctx.setdefault(lvl, []).append(prev_text)
-            parent = ctx.get(lvl - 1, [None])[-1] if lvl > 1 else None
-            headings.append({"text": htext, "line_number": ln, "level": lvl, "parent": parent})
-            prev_lvl, prev_text = lvl, htext
-            break
 
     return headings
 
 
 def find_section_boundaries(text: str, headings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Slice *text* into sections using *headings*."""
-    lines = text.split("\n")
-    total = len(lines)
-    sections: List[Dict[str, Any]] = []
-    for idx, h in enumerate(headings):
-        start = h["line_number"]
-        end = headings[idx + 1]["line_number"] - 1 if idx + 1 < len(headings) else total
-        sections.append({
-            **h,
-            "start_line": start,
-            "end_line": end,
-            "content": "\n".join(lines[start:end]).strip()
-        })
+    """
+    Find the start and end boundaries of sections defined by headings.
+    """
+    lines = text.split('\n')
+    total_lines = len(lines)
+    sections = []
+
+    for i, heading in enumerate(headings):
+        section = heading.copy()
+        start_line = heading['line_number']
+        if i < len(headings) - 1:
+            end_line = headings[i + 1]['line_number'] - 1
+        else:
+            end_line = total_lines
+        section_content = '\n'.join(lines[start_line:end_line]).strip()
+        section['start_line'] = start_line
+        section['end_line'] = end_line
+        section['content'] = section_content
+        sections.append(section)
+
     return sections
 
-###############################################################################
-# Table extraction                                                            #
-###############################################################################
 
-def _looks_like_table(df: pd.DataFrame) -> bool:
-    """Return *True* if *df* is considered a real table (≥2 rows & ≥2 cols)."""
-    return df.shape[0] >= 2 and df.shape[1] >= 2
+def extract_tables(page, pdf_name: str, page_num: int, tables_dir: str = './tables') -> List[Dict[str, Any]]:
+    """
+    Extract tables from a PDF page using pdfplumber, save as CSV, and return info.
+    """
+    tables = []
+    os.makedirs(tables_dir, exist_ok=True)
 
-
-def extract_tables(page: pdfplumber.page.Page, pdf_stem: str, page_num: int,
-                   out_dir: str = "./tables") -> List[Dict[str, Any]]:
-    """Extract *true* tables with pdfplumber, write CSV, return metadata list."""
-    os.makedirs(out_dir, exist_ok=True)
-    tables: List[Dict[str, Any]] = []
     try:
-        for idx, raw in enumerate(page.extract_tables() or []):
-            df = pd.DataFrame(raw)
-            if not _looks_like_table(df):
-                continue  # skip word‑lists / single‑column junk
-            csv_name = f"{pdf_stem}_page_{page_num + 1}_table_{idx + 1}.csv"
-            df.to_csv(os.path.join(out_dir, csv_name), index=False, header=False)
+        page_tables = page.extract_tables()
+        for i, table_data in enumerate(page_tables):
+            if not table_data or len(table_data) == 0:
+                continue
+
+            df = pd.DataFrame(table_data)
+            csv_filename = f"{pdf_name}_page_{page_num+1}_table_{i+1}.csv"
+            csv_path = os.path.join(tables_dir, csv_filename)
+            df.to_csv(csv_path, index=False, header=False)
+
             tables.append({
-                "table_number": idx + 1,
-                "csv_file": csv_name,
-                "rows": df.shape[0],
-                "columns": df.shape[1],
-                "extraction_method": "pdfplumber"
+                'table_number': i + 1,
+                'csv_file': csv_filename,
+                'rows': len(df),
+                'columns': len(df.columns),
+                'extraction_method': 'pdfplumber'
             })
-    except Exception as exc:
-        logger.warning("pdfplumber table extraction failed on page %s: %s", page_num + 1, exc)
+
+    except Exception as e:
+        logger.warning(f"Error extracting tables with pdfplumber: {str(e)}")
+
     return tables
 
 
-def extract_tables_camelot(pdf_path: str, page_num: int, pdf_stem: str,
-                           out_dir: str = "./tables") -> List[Dict[str, Any]]:
-    """Use Camelot to extract *true* tables from *page_num* (0‑based)."""
-    if not HAS_CAMELOT:
-        return []
-    os.makedirs(out_dir, exist_ok=True)
-    page_label = page_num + 1  # Camelot is 1‑based
-    tables: List[Dict[str, Any]] = []
+def extract_tables_with_camelot(pdf_path: str, page_num: int, pdf_name: str, tables_dir: str = './tables') -> List[Dict[str, Any]]:
+    """
+    Extract tables from a PDF page using camelot, save as CSV, and return info.
+    """
+    tables = []
+    page_index = page_num + 1
+    os.makedirs(tables_dir, exist_ok=True)
+
     try:
-        for flavor in ("lattice", "stream"):
-            for idx, tbl in enumerate(camelot.read_pdf(pdf_path, pages=str(page_label),
-                                                       flavor=flavor, suppress_stdout=True)):
-                df = tbl.df
-                if not _looks_like_table(df):
-                    continue
-                csv_name = f"{pdf_stem}_page_{page_label}_table_{flavor}_{idx + 1}.csv"
-                df.to_csv(os.path.join(out_dir, csv_name), index=False, header=False)
-                tables.append({
-                    "table_number": idx + 1,
-                    "csv_file": csv_name,
-                    "rows": df.shape[0],
-                    "columns": df.shape[1],
-                    "accuracy": getattr(tbl, "accuracy", None),
-                    "whitespace": getattr(tbl, "whitespace", None),
-                    "extraction_method": f"camelot-{flavor}"
-                })
-    except Exception as exc:
-        logger.warning("Camelot failed on page %s: %s", page_label, exc)
+        lattice_tables = camelot.read_pdf(
+            pdf_path,
+            pages=str(page_index),
+            flavor='lattice',
+            suppress_stdout=True
+        )
+        stream_tables = camelot.read_pdf(
+            pdf_path,
+            pages=str(page_index),
+            flavor='stream',
+            suppress_stdout=True
+        )
+
+        def save_camelot_tables(camelot_tables, flavor):
+            local_tables = []
+            for i, tbl in enumerate(camelot_tables):
+                if not tbl.df.empty:
+                    csv_filename = f"{pdf_name}_page_{page_index}_table_{flavor}_{i+1}.csv"
+                    csv_path = os.path.join(tables_dir, csv_filename)
+                    tbl.df.to_csv(csv_path, index=False, header=False)
+
+                    local_tables.append({
+                        'table_number': i + 1,
+                        'csv_file': csv_filename,
+                        'rows': len(tbl.df),
+                        'columns': len(tbl.df.columns),
+                        'accuracy': tbl.accuracy,
+                        'whitespace': tbl.whitespace,
+                        'extraction_method': f'camelot-{flavor}'
+                    })
+            return local_tables
+
+        tables += save_camelot_tables(lattice_tables, 'lattice')
+        tables += save_camelot_tables(stream_tables, 'stream')
+
+    except Exception as e:
+        logger.warning(f"Error extracting tables with Camelot: {str(e)}")
+
     return tables
 
-###############################################################################
-# Word‑level spatial extraction                                               #
-###############################################################################
 
-def extract_words_to_csv(page: pdfplumber.page.Page, pdf_stem: str, page_num: int,
-                         out_dir: str = "./words") -> Dict[str, Any]:
-    os.makedirs(out_dir, exist_ok=True)
-    words = page.extract_words() or []
-    if not words:
-        return {"words_csv_file": None, "words_list": []}
+def extract_spatial_elements(page, pdf_name: str, page_num: int, words_dir: str = './words') -> Dict[str, Any]:
+    """
+    Extract text elements with their spatial information from a PDF page, save coords in CSV.
+    Return a simplified structure for JSON (just words, plus CSV filename).
+    """
+    os.makedirs(words_dir, exist_ok=True)
+    words = page.extract_words()
 
-    records = [
-        [
-            w.get("text", ""),
-            w.get("x0", 0),
-            w.get("x1", 0),
-            w.get("top", 0),
-            w.get("bottom", 0),
-            w.get("width", 0),
-            w.get("height", 0)
-        ]
-        for w in words
-    ]
-    df = pd.DataFrame(records, columns=["text", "x0", "x1", "y0", "y1", "width", "height"])
-    csv_name = f"{pdf_stem}_page_{page_num + 1}_words.csv"
-    df.to_csv(os.path.join(out_dir, csv_name), index=False)
+    word_data = []
+    for w in words:
+        text = w.get('text', '')
+        x0 = w.get('x0', 0)
+        x1 = w.get('x1', 0)
+        y0 = w.get('top', 0)
+        y1 = w.get('bottom', 0)
+        width = w.get('width', 0)
+        height = w.get('height', 0)
+        word_data.append([text, x0, x1, y0, y1, width, height])
+
+    if word_data:
+        df = pd.DataFrame(word_data, columns=["text", "x0", "x1", "y0", "y1", "width", "height"])
+        csv_filename = f"{pdf_name}_page_{page_num+1}_words.csv"
+        csv_path = os.path.join(words_dir, csv_filename)
+        df.to_csv(csv_path, index=False)
+        words_list = df["text"].tolist()
+    else:
+        csv_filename = None
+        words_list = []
+
     return {
-        "words_csv_file": csv_name,
-        "words_list": df["text"].tolist()
+        'words_csv_file': csv_filename,
+        'words_list': words_list
     }
 
-###############################################################################
-# Per‑page processing                                                         #
-###############################################################################
 
-def process_page(pdf_path: str, page_num: int, img_dir: str, tbl_dir: str,
-                 wdir: str) -> Dict[str, Any]:
-    pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
-    page_info: Dict[str, Any] = {
-        "page_number": page_num + 1,
-        "is_scanned": False,
-        "image_path": None,
-        "text": None,
-        "headings": [],
-        "sections": [],
-        "tables": [],
-        "words_csv_file": None,
-        "words_list": [],
-        "width": None,
-        "height": None
+def process_page(pdf_path: str, page_num: int, output_dir: str, tables_dir: str, words_dir: str) -> Dict[str, Any]:
+    """
+    Process a single PDF page to extract information.
+    """
+    pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    page_info = {
+        'page_number': page_num + 1,
+        'is_scanned': False,
+        'image_path': None,
+        'text': None,
+        'headings': [],
+        'sections': [],
+        'tables': [],
+        'words_csv_file': None,
+        'words_list': [],
+        'width': None,
+        'height': None
     }
 
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num]
-        page_info["width"], page_info["height"] = page.width, page.height
-
         if is_page_scanned(page):
-            page_info["is_scanned"] = True
-            page_info["image_path"] = save_page_as_image(pdf_path, page_num, img_dir)
-            return page_info  # nothing else to do
-
-        text = page.extract_text() or ""
-        page_info["text"] = text
-        if text:
-            page_info["headings"] = extract_headings(text)
-            page_info["sections"] = find_section_boundaries(text, page_info["headings"])
-
-        # --- table extraction -------------------------------------------------
-        page_info["tables"] = extract_tables(page, pdf_stem, page_num, tbl_dir)
-        camelot_tables = extract_tables_camelot(pdf_path, page_num, pdf_stem, tbl_dir)
-        if camelot_tables and (
-            len(camelot_tables) > len(page_info["tables"]) or
-            any(t.get("accuracy", 0) and t["accuracy"] > 80 for t in camelot_tables)
-        ):
-            page_info["tables"] = camelot_tables
+            page_info['is_scanned'] = True
+            page_info['image_path'] = save_page_as_image(pdf_path, page_num, output_dir)
         else:
-            # merge unique ones
-            existing = {(t["csv_file"] or "") for t in page_info["tables"]}
-            for t in camelot_tables:
-                if t["csv_file"] not in existing:
-                    page_info["tables"].append(t)
+            # Extract text
+            text = page.extract_text()
+            page_info['text'] = text
 
-        # --- word coordinates -------------------------------------------------
-        word_meta = extract_words_to_csv(page, pdf_stem, page_num, wdir)
-        page_info.update(word_meta)
+            # Extract headings and sections
+            if text:
+                page_info['headings'] = extract_headings(text)
+                page_info['sections'] = find_section_boundaries(text, page_info['headings'])
+
+            # Extract tables with pdfplumber
+            page_info['tables'] = extract_tables(page, pdf_name, page_num, tables_dir)
+
+            # Attempt advanced table extraction via Camelot
+            try:
+                camelot_tables = extract_tables_with_camelot(pdf_path, page_num, pdf_name, tables_dir)
+                # If Camelot finds more/better tables, replace
+                if camelot_tables and (
+                    len(camelot_tables) > len(page_info['tables']) or
+                    any(t.get('accuracy', 0) > 80 for t in camelot_tables)
+                ):
+                    page_info['tables'] = camelot_tables
+                else:
+                    # Or merge them in if there's anything new
+                    existing_count = len(page_info['tables'])
+                    for i, tinfo in enumerate(camelot_tables):
+                        tinfo['table_number'] = existing_count + i + 1
+                        page_info['tables'].append(tinfo)
+            except Exception as e:
+                logger.warning(f"Error in Camelot extraction: {e}")
+
+            # Extract spatial elements (words), store CSV
+            word_info = extract_spatial_elements(page, pdf_name, page_num, words_dir)
+            page_info['words_csv_file'] = word_info['words_csv_file']
+            page_info['words_list'] = word_info['words_list']
+
+        # Page dimensions
+        page_info['width'] = page.width
+        page_info['height'] = page.height
 
     return page_info
 
-###############################################################################
-# Document‑level orchestration                                                #
-###############################################################################
 
-def extract_metadata(reader: PdfReader, path: str) -> Dict[str, Any]:
-    meta = reader.metadata or {}
-    return {
-        "filename": os.path.basename(path),
-        "path": path,
-        "pages": len(reader.pages),
-        "title": meta.get("/Title"),
-        "author": meta.get("/Author"),
-        "subject": meta.get("/Subject"),
-        "keywords": meta.get("/Keywords"),
-        "creation_date": meta.get("/CreationDate"),
-        "modification_date": meta.get("/ModDate")
+def extract_document_metadata(pdf, pdf_path: str) -> Dict[str, Any]:
+    """
+    Extract metadata from a PDF document.
+    """
+    metadata = {
+        'filename': os.path.basename(pdf_path),
+        'path': pdf_path,
+        'pages': len(pdf.pages),
+        'title': None,
+        'author': None,
+        'subject': None,
+        'keywords': None,
+        'creation_date': None,
+        'modification_date': None
     }
 
+    pdf_metadata = pdf.metadata
+    if pdf_metadata:
+        if pdf_metadata.get('/Title'):
+            metadata['title'] = pdf_metadata.get('/Title')
+        if pdf_metadata.get('/Author'):
+            metadata['author'] = pdf_metadata.get('/Author')
+        if pdf_metadata.get('/Subject'):
+            metadata['subject'] = pdf_metadata.get('/Subject')
+        if pdf_metadata.get('/Keywords'):
+            metadata['keywords'] = pdf_metadata.get('/Keywords')
+        if pdf_metadata.get('/CreationDate'):
+            metadata['creation_date'] = pdf_metadata.get('/CreationDate')
+        if pdf_metadata.get('/ModDate'):
+            metadata['modification_date'] = pdf_metadata.get('/ModDate')
 
-def summarise(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return metadata
+
+
+def generate_document_summary(document_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate a summary of the document based on extracted information.
+    """
     summary = {
-        "title": doc.get("title") or "Untitled",
-        "author": doc.get("author") or "Unknown",
-        "total_pages": doc.get("pages", 0),
-        "digital_pages": 0,
-        "scanned_pages": 0,
-        "tables_count": 0,
-        "headings_count": 0,
-        "document_type": "Unknown",
-        "creation_date": doc.get("creation_date")
+        'title': document_info.get('title', 'Untitled Document'),
+        'author': document_info.get('author', 'Unknown Author'),
+        'total_pages': document_info.get('pages', 0),
+        'digital_pages': 0,
+        'scanned_pages': 0,
+        'headings_count': 0,
+        'tables_count': 0,
+        'creation_date': document_info.get('creation_date'),
+        'document_type': 'Unknown'
     }
-    all_heads = []
-    for p in doc.get("pages", []):
-        if p["is_scanned"]:
-            summary["scanned_pages"] += 1
+
+    pages_info = document_info.get('pages', [])
+    all_headings = []
+
+    for page in pages_info:
+        if page.get('is_scanned'):
+            summary['scanned_pages'] += 1
         else:
-            summary["digital_pages"] += 1
-        summary["tables_count"] += len(p["tables"])
-        all_heads.extend(p["headings"])
-    summary["headings_count"] = len(all_heads)
-    if any(h["text"].lower().startswith("abstract") for h in all_heads):
-        summary["document_type"] = "Academic Paper"
+            summary['digital_pages'] += 1
+        # Count tables
+        tables = page.get('tables', [])
+        summary['tables_count'] += len(tables)
+        # Gather headings
+        headings = page.get('headings', [])
+        all_headings.extend(headings)
+
+    summary['headings_count'] = len(all_headings)
+
+    # Simple doc type detection
+    if all_headings:
+        main_headings_text = ' '.join([h['text'].lower() for h in all_headings if h.get('level', 0) == 1])
+        if 'report' in main_headings_text or 'case' in main_headings_text:
+            summary['document_type'] = 'Case Report/Medical Document'
+        elif 'chapter' in main_headings_text or 'section' in main_headings_text:
+            summary['document_type'] = 'Book/Publication'
+        elif 'abstract' in main_headings_text or 'introduction' in main_headings_text:
+            summary['document_type'] = 'Academic Paper'
+        elif 'resume' in main_headings_text or 'cv' in main_headings_text:
+            summary['document_type'] = 'Resume/CV'
+
     return summary
 
 
-def process_pdf(pdf_path: str, img_dir: str = "./images", tbl_dir: str = "./tables",
-                wdir: str = "./words") -> Dict[str, Any]:
-    logger.info("Processing PDF %s", pdf_path)
-    reader = PdfReader(pdf_path)
-    doc_info = extract_metadata(reader, pdf_path)
+def process_pdf(pdf_path: str,
+                output_dir: str = "./images",
+                tables_dir: str = "./tables",
+                words_dir: str = "./words") -> Dict[str, Any]:
+    """
+    Process a PDF document to extract structured information with parallel processing.
+    """
+    logger.info(f"Processing PDF: {pdf_path}")
 
-    futures, pages = [], []  # type: ignore
+    try:
+        pdf_reader = PdfReader(pdf_path)
+        document_info = extract_document_metadata(pdf_reader, pdf_path)
 
-    with ProcessPoolExecutor() as pool:
-        for i in range(len(reader.pages)):
-            futures.append(pool.submit(process_page, pdf_path, i, img_dir, tbl_dir, wdir))
-        for fut in as_completed(futures):
-            pages.append(fut.result())
+        # Parallel processing of pages
+        page_count = len(pdf_reader.pages)
+        futures = []
+        pages_info = []
+        with ProcessPoolExecutor() as executor:
+            for page_num in range(page_count):
+                futures.append(executor.submit(
+                    process_page,
+                    pdf_path,
+                    page_num,
+                    output_dir,
+                    tables_dir,
+                    words_dir
+                ))
+            for future in as_completed(futures):
+                result = future.result()
+                pages_info.append(result)
 
-    pages.sort(key=lambda p: p["page_number"])
-    doc_info["pages"] = pages
-    doc_info["summary"] = summarise(doc_info)
+        # Sort pages by page_number
+        pages_info.sort(key=lambda x: x['page_number'])
+        document_info['pages'] = pages_info
 
-    return doc_info
+        # Document summary
+        document_info['summary'] = generate_document_summary(document_info)
+        return document_info
 
-###############################################################################
-# I/O utilities                                                               #
-###############################################################################
+    except Exception as e:
+        logger.error(f"Error processing PDF: {e}")
+        return {
+            'error': str(e),
+            'filename': os.path.basename(pdf_path),
+            'path': pdf_path
+        }
 
-def write_json(doc: Dict[str, Any], out_path: Optional[str] = None) -> str:
-    if not out_path:
-        out_path = f"{os.path.splitext(doc['filename'])[0]}.json"
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2)
-    logger.info("JSON written to %s", out_path)
-    return out_path
 
-###############################################################################
-# CLI                                                                         #
-###############################################################################
+def save_json_output(document_info: Dict[str, Any], output_path: Optional[str] = None) -> str:
+    """
+    Save document information as JSON.
+    """
+    if output_path is None:
+        if 'filename' in document_info:
+            base_name = os.path.splitext(document_info['filename'])[0]
+            output_path = f"{base_name}.json"
+        else:
+            output_path = "pdf_output.json"
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Parse PDF to structured JSON + CSV artefacts")
-    ap.add_argument("pdf_path")
-    ap.add_argument("--output", "-o")
-    ap.add_argument("--images-dir", "-i", default="./images")
-    ap.add_argument("--tables-dir", "-t", default="./tables")
-    ap.add_argument("--words-dir", "-w", default="./words")
-    args = ap.parse_args()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
+    json_data = json.dumps(document_info, indent=2)
 
-    doc = process_pdf(args.pdf_path, args.images_dir, args.tables_dir, args.words_dir)
-    json_path = write_json(doc, args.output)
-    print(f"Finished. JSON saved to {json_path}")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(json_data)
+
+    logger.info(f"Saved JSON output to {output_path}")
+    return output_path
+
+
+def main():
+    """
+    Main function to process a PDF document and generate JSON output.
+    """
+    parser = argparse.ArgumentParser(description='Process a PDF document and generate JSON output')
+    parser.add_argument('pdf_path', help='Path to the PDF file')
+    parser.add_argument('--output', '-o', help='Path to save the JSON output')
+    parser.add_argument('--images-dir', '-i', default='./images', help='Directory to save images for scanned pages')
+    parser.add_argument('--tables-dir', '-t', default='./tables', help='Directory to save CSV files for tables')
+    parser.add_argument('--words-dir', '-w', default='./words', help='Directory to save CSV files for word coords')
+    args = parser.parse_args()
+
+    document_info = process_pdf(args.pdf_path, args.images_dir, args.tables_dir, args.words_dir)
+    json_path = save_json_output(document_info, args.output)
+    print(f"PDF processing complete. JSON output saved to: {json_path}")
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        json_data = f.read()
+    print("\nJSON Output:")
+    print(json_data)
 
 
 if __name__ == "__main__":
