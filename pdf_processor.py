@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-"""
-PDF Processing Pipeline (parallel‑enabled)
-
-This script processes PDF documents to extract structured information and generates
-JSON output containing document metadata, text content, and structure information.
-
-Key features
-------------
-* **Parallel page processing** – `concurrent.futures.ProcessPoolExecutor` speeds up multi‑page PDFs.
-* **Tables written to CSV** – Only pages that truly contain tabular structures (≥ 2 rows **and** ≥ 2 columns) are persisted; otherwise they are ignored.
-* **Word coordinates written to CSV** – Each page’s word‑level spatial data are stored in a CSV; the JSON keeps just the filename and plain word list.
-* **Scanned‑page detection** – Pages without digital text are rasterised to PNG for downstream OCR.
-
-Dependencies
-------------
-```
-pdfplumber   PyPDF2   camelot‑py   pandas   pillow   numpy   opencv‑python
-```
 Optional libraries are auto‑detected; the script degrades gracefully when Camelot or OpenCV are absent.
 """
 
@@ -67,7 +48,7 @@ def is_page_scanned(page: pdfplumber.page.Page) -> bool:
         if text_chars_per_image < 200:
             return True
 
-    # crude OCR artefact check
+    # crude OCR artifact check
     artefacts = re.findall(r"[^\w\s,.;:!?()\[\]{}\-]{3,}", text)
     if len(artefacts) > 3:
         return True
@@ -95,11 +76,11 @@ def save_page_as_image(pdf_path: str, page_num: int, out_dir: str = "./images") 
 def extract_headings(text: str) -> List[Dict[str, Any]]:
     """Return a list of detected headings with hierarchy level."""
     patterns = [
-        (r"^[\s]*([A-Z][A-Z\s]+)[\s]*$", 1),                 # ALL‑CAPS
-        (r"^[\s]*(\d+\.\s+.+)[\s]*$", 2),                  # 1. Intro
-        (r"^[\s]*([A-Z][A-Za-z\s]+):[\s]*$", 2),             # Background:
-        (r"^[\s]*([A-Z][a-z\s]{2,})[\s]*$", 3),              # Sentence case
-        (r"^[\s]*[•\-*]\s+([A-Z].+?)[\s]*$", 3),            # bullet
+        (r"^[\s]*([A-Z][A-Z\s]+)[\s]*$", 1),  # ALL‑CAPS
+        (r"^[\s]*(\d+\.\s+.+)[\s]*$", 2),     # 1. Intro
+        (r"^[\s]*([A-Z][A-Za-z\s]+):[\s]*$", 2),  # Background:
+        (r"^[\s]*([A-Z][a-z\s]{2,})[\s]*$", 3),   # Sentence case
+        (r"^[\s]*[•\-*]\s+([A-Z].+?)[\s]*$", 3),  # bullet
     ]
 
     headings: List[Dict[str, Any]] = []
@@ -132,6 +113,7 @@ def extract_headings(text: str) -> List[Dict[str, Any]]:
             headings.append({"text": htext, "line_number": ln, "level": lvl, "parent": parent})
             prev_lvl, prev_text = lvl, htext
             break
+
     return headings
 
 
@@ -143,8 +125,12 @@ def find_section_boundaries(text: str, headings: List[Dict[str, Any]]) -> List[D
     for idx, h in enumerate(headings):
         start = h["line_number"]
         end = headings[idx + 1]["line_number"] - 1 if idx + 1 < len(headings) else total
-        sections.append({**h, "start_line": start, "end_line": end,
-                          "content": "\n".join(lines[start:end]).strip()})
+        sections.append({
+            **h,
+            "start_line": start,
+            "end_line": end,
+            "content": "\n".join(lines[start:end]).strip()
+        })
     return sections
 
 ###############################################################################
@@ -168,16 +154,20 @@ def extract_tables(page: pdfplumber.page.Page, pdf_stem: str, page_num: int,
                 continue  # skip word‑lists / single‑column junk
             csv_name = f"{pdf_stem}_page_{page_num + 1}_table_{idx + 1}.csv"
             df.to_csv(os.path.join(out_dir, csv_name), index=False, header=False)
-            tables.append({"table_number": idx + 1, "csv_file": csv_name,
-                           "rows": df.shape[0], "columns": df.shape[1],
-                           "extraction_method": "pdfplumber"})
+            tables.append({
+                "table_number": idx + 1,
+                "csv_file": csv_name,
+                "rows": df.shape[0],
+                "columns": df.shape[1],
+                "extraction_method": "pdfplumber"
+            })
     except Exception as exc:
         logger.warning("pdfplumber table extraction failed on page %s: %s", page_num + 1, exc)
     return tables
 
 
 def extract_tables_camelot(pdf_path: str, page_num: int, pdf_stem: str,
-                            out_dir: str = "./tables") -> List[Dict[str, Any]]:
+                           out_dir: str = "./tables") -> List[Dict[str, Any]]:
     """Use Camelot to extract *true* tables from *page_num* (0‑based)."""
     if not HAS_CAMELOT:
         return []
@@ -193,11 +183,15 @@ def extract_tables_camelot(pdf_path: str, page_num: int, pdf_stem: str,
                     continue
                 csv_name = f"{pdf_stem}_page_{page_label}_table_{flavor}_{idx + 1}.csv"
                 df.to_csv(os.path.join(out_dir, csv_name), index=False, header=False)
-                tables.append({"table_number": idx + 1, "csv_file": csv_name,
-                               "rows": df.shape[0], "columns": df.shape[1],
-                               "accuracy": getattr(tbl, "accuracy", None),
-                               "whitespace": getattr(tbl, "whitespace", None),
-                               "extraction_method": f"camelot-{flavor}"})
+                tables.append({
+                    "table_number": idx + 1,
+                    "csv_file": csv_name,
+                    "rows": df.shape[0],
+                    "columns": df.shape[1],
+                    "accuracy": getattr(tbl, "accuracy", None),
+                    "whitespace": getattr(tbl, "whitespace", None),
+                    "extraction_method": f"camelot-{flavor}"
+                })
     except Exception as exc:
         logger.warning("Camelot failed on page %s: %s", page_label, exc)
     return tables
@@ -207,19 +201,31 @@ def extract_tables_camelot(pdf_path: str, page_num: int, pdf_stem: str,
 ###############################################################################
 
 def extract_words_to_csv(page: pdfplumber.page.Page, pdf_stem: str, page_num: int,
-                          out_dir: str = "./words") -> Dict[str, Any]:
+                         out_dir: str = "./words") -> Dict[str, Any]:
     os.makedirs(out_dir, exist_ok=True)
     words = page.extract_words() or []
     if not words:
         return {"words_csv_file": None, "words_list": []}
 
-    records = [[w.get("text", ""), w.get("x0", 0), w.get("x1", 0),
-                w.get("top", 0), w.get("bottom", 0),
-                w.get("width", 0), w.get("height", 0)] for w in words]
+    records = [
+        [
+            w.get("text", ""),
+            w.get("x0", 0),
+            w.get("x1", 0),
+            w.get("top", 0),
+            w.get("bottom", 0),
+            w.get("width", 0),
+            w.get("height", 0)
+        ]
+        for w in words
+    ]
     df = pd.DataFrame(records, columns=["text", "x0", "x1", "y0", "y1", "width", "height"])
     csv_name = f"{pdf_stem}_page_{page_num + 1}_words.csv"
     df.to_csv(os.path.join(out_dir, csv_name), index=False)
-    return {"words_csv_file": csv_name, "words_list": df["text"].tolist()}
+    return {
+        "words_csv_file": csv_name,
+        "words_list": df["text"].tolist()
+    }
 
 ###############################################################################
 # Per‑page processing                                                         #
@@ -228,11 +234,19 @@ def extract_words_to_csv(page: pdfplumber.page.Page, pdf_stem: str, page_num: in
 def process_page(pdf_path: str, page_num: int, img_dir: str, tbl_dir: str,
                  wdir: str) -> Dict[str, Any]:
     pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
-    page_info: Dict[str, Any] = {"page_number": page_num + 1, "is_scanned": False,
-                                 "image_path": None, "text": None,
-                                 "headings": [], "sections": [], "tables": [],
-                                 "words_csv_file": None, "words_list": [],
-                                 "width": None, "height": None}
+    page_info: Dict[str, Any] = {
+        "page_number": page_num + 1,
+        "is_scanned": False,
+        "image_path": None,
+        "text": None,
+        "headings": [],
+        "sections": [],
+        "tables": [],
+        "words_csv_file": None,
+        "words_list": [],
+        "width": None,
+        "height": None
+    }
 
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num]
@@ -252,8 +266,10 @@ def process_page(pdf_path: str, page_num: int, img_dir: str, tbl_dir: str,
         # --- table extraction -------------------------------------------------
         page_info["tables"] = extract_tables(page, pdf_stem, page_num, tbl_dir)
         camelot_tables = extract_tables_camelot(pdf_path, page_num, pdf_stem, tbl_dir)
-        if camelot_tables and (len(camelot_tables) > len(page_info["tables"]) or
-                               any(t.get("accuracy", 0) and t["accuracy"] > 80 for t in camelot_tables)):
+        if camelot_tables and (
+            len(camelot_tables) > len(page_info["tables"]) or
+            any(t.get("accuracy", 0) and t["accuracy"] > 80 for t in camelot_tables)
+        ):
             page_info["tables"] = camelot_tables
         else:
             # merge unique ones
@@ -274,21 +290,31 @@ def process_page(pdf_path: str, page_num: int, img_dir: str, tbl_dir: str,
 
 def extract_metadata(reader: PdfReader, path: str) -> Dict[str, Any]:
     meta = reader.metadata or {}
-    return {"filename": os.path.basename(path), "path": path,
-            "pages": len(reader.pages),
-            "title": meta.get("/Title"), "author": meta.get("/Author"),
-            "subject": meta.get("/Subject"), "keywords": meta.get("/Keywords"),
-            "creation_date": meta.get("/CreationDate"),
-            "modification_date": meta.get("/ModDate")}
+    return {
+        "filename": os.path.basename(path),
+        "path": path,
+        "pages": len(reader.pages),
+        "title": meta.get("/Title"),
+        "author": meta.get("/Author"),
+        "subject": meta.get("/Subject"),
+        "keywords": meta.get("/Keywords"),
+        "creation_date": meta.get("/CreationDate"),
+        "modification_date": meta.get("/ModDate")
+    }
 
 
 def summarise(doc: Dict[str, Any]) -> Dict[str, Any]:
-    summary = {"title": doc.get("title") or "Untitled",
-               "author": doc.get("author") or "Unknown",
-               "total_pages": doc.get("pages", 0),
-               "digital_pages": 0, "scanned_pages": 0,
-               "tables_count": 0, "headings_count": 0,
-               "document_type": "Unknown", "creation_date": doc.get("creation_date")}
+    summary = {
+        "title": doc.get("title") or "Untitled",
+        "author": doc.get("author") or "Unknown",
+        "total_pages": doc.get("pages", 0),
+        "digital_pages": 0,
+        "scanned_pages": 0,
+        "tables_count": 0,
+        "headings_count": 0,
+        "document_type": "Unknown",
+        "creation_date": doc.get("creation_date")
+    }
     all_heads = []
     for p in doc.get("pages", []):
         if p["is_scanned"]:
@@ -309,15 +335,18 @@ def process_pdf(pdf_path: str, img_dir: str = "./images", tbl_dir: str = "./tabl
     reader = PdfReader(pdf_path)
     doc_info = extract_metadata(reader, pdf_path)
 
-    futures, pages: List[Any], List[Dict[str, Any]] = [], []
+    futures, pages = [], []  # type: ignore
+
     with ProcessPoolExecutor() as pool:
         for i in range(len(reader.pages)):
             futures.append(pool.submit(process_page, pdf_path, i, img_dir, tbl_dir, wdir))
         for fut in as_completed(futures):
             pages.append(fut.result())
+
     pages.sort(key=lambda p: p["page_number"])
     doc_info["pages"] = pages
     doc_info["summary"] = summarise(doc_info)
+
     return doc_info
 
 ###############################################################################
@@ -326,7 +355,7 @@ def process_pdf(pdf_path: str, img_dir: str = "./images", tbl_dir: str = "./tabl
 
 def write_json(doc: Dict[str, Any], out_path: Optional[str] = None) -> str:
     if not out_path:
-        out_path = f"{os.path.splitext(doc["filename"])[0]}.json"
+        out_path = f"{os.path.splitext(doc['filename'])[0]}.json"
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
     logger.info("JSON written to %s", out_path)
