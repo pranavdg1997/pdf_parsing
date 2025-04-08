@@ -1,5 +1,4 @@
-Optional libraries are auto‑detected; the script degrades gracefully when Camelot or OpenCV are absent.
-"""
+
 
 from __future__ import annotations
 
